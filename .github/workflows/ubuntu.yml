@@ -1,0 +1,225 @@
+name: Ubuntu
+
+on:
+  workflow_dispatch:
+    inputs:
+      timeout_minutes:
+        description: 'Max session duration in minutes (GitHub free public repo hard cap ~360)'
+        required: false
+        default: '350'
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  ssh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install prebuilt tools (git curl make nano openssh-server)
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends \
+            openssh-server git curl make nano unzip
+          git --version; curl --version | head -1; make --version | head -1; nano --version | head -1
+
+      - name: Set global git identity
+        run: |
+          git config --global user.name "Hafidz Muzakky"
+          git config --global user.email "ais.muzakky@gmail.com"
+          git config --global --list
+
+      - name: Create a clean login user + configure sshd
+        run: |
+          sudo mkdir -p /var/run/sshd
+          PASSWORD=$(openssl rand -base64 15)
+
+          # Fresh user with a truly empty home, isolated from the actions-runner's
+          # own files (avoids inheriting /home/runner/work/... clutter).
+          sudo useradd -m -s /bin/bash dev
+          echo "dev:${PASSWORD}" | sudo chpasswd
+          sudo usermod -aG sudo dev
+          echo "dev ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/dev > /dev/null
+          # useradd -m only seeds dotfiles from /etc/skel; strip anything extra so
+          # the very first `ls -la` after login shows an empty directory.
+          sudo find /home/dev -mindepth 1 -maxdepth 1 ! -name '.bashrc' ! -name '.profile' \
+            -exec rm -rf {} +
+
+          {
+            echo "PasswordAuthentication yes"
+            echo "PermitRootLogin no"
+            echo "ClientAliveInterval 30"
+            echo "ClientAliveCountMax 10"
+          } | sudo tee -a /etc/ssh/sshd_config > /dev/null
+          sudo service ssh restart
+          echo "SSH_PASSWORD=${PASSWORD}" >> "$GITHUB_ENV"
+
+      - name: Verify sshd is actually listening locally
+        run: |
+          sudo systemctl status ssh --no-pager || true
+          echo "--- listening sockets ---"
+          ss -tlnp | grep ':22' || echo "sshd is NOT listening on port 22!"
+          echo "--- loopback connect test ---"
+          timeout 5 bash -c '</dev/tcp/127.0.0.1/22' \
+            && echo "OK: local port 22 accepts connections" \
+            || echo "FAILED: local port 22 refused/timed out — none of the tunnels will work if this fails"
+
+      - name: Make 'exit' end the whole session
+        run: |
+          # When the interactive login shell exits (type `exit`, Ctrl-D, or the
+          # terminal just closes), this trap drops /tmp/stop, which the
+          # "Keep session alive" step below is polling for.
+          sudo tee -a /home/dev/.bashrc > /dev/null <<'EOF'
+
+          # Ending this SSH session stops the whole GitHub Actions job.
+          trap 'touch /tmp/stop' EXIT
+          EOF
+          sudo chown dev:dev /home/dev/.bashrc
+
+      - name: Install ngrok
+        run: |
+          curl -sSL https://ngrok-agent.s3.amazonaws.com/ngrok.asc \
+            | sudo tee /etc/apt/trusted.gpg.d/ngrok.asc > /dev/null
+          echo "deb https://ngrok-agent.s3.amazonaws.com buster main" \
+            | sudo tee /etc/apt/sources.list.d/ngrok.list
+          sudo apt-get update -y
+          sudo apt-get install -y ngrok
+          ngrok config add-authtoken "${{ secrets.NGROK_AUTHTOKEN }}"
+
+      - name: Open 4 parallel tunnels (ngrok + serveo + Pinggy + LocalXpose)
+        env:
+          LOCALXPOSE_ACCESS_TOKEN: ${{ secrets.LOCALXPOSE_ACCESS_TOKEN }}
+        run: |
+          # GitHub Actions runs bash with `-e -o pipefail` by default, so a single
+          # `grep` that finds no match (very normal while we're still polling)
+          # would abort this whole step. Turn that off for this step on purpose —
+          # every failure path below is already handled explicitly.
+          set +e +o pipefail
+
+          echo "=================================================="
+          echo "User    : dev"
+          echo "Password: ${SSH_PASSWORD}"
+          echo "=================================================="
+
+          # ---------- 1) ngrok ----------
+          nohup ngrok tcp 22 --log stdout > /tmp/ngrok.log 2>&1 &
+          NGROK_ADDR=""
+          for i in $(seq 1 15); do
+            sleep 2
+            NGROK_ADDR=$(curl -s http://127.0.0.1:4040/api/tunnels | grep -o '"public_url":"tcp://[^"]*' | cut -d'/' -f3)
+            [ -n "$NGROK_ADDR" ] && break
+          done
+          if [ -n "$NGROK_ADDR" ]; then
+            NGROK_HOST=$(echo "$NGROK_ADDR" | cut -d: -f1)
+            NGROK_PORT=$(echo "$NGROK_ADDR" | cut -d: -f2)
+            echo "[1/4] ngrok      OK -> ssh dev@${NGROK_HOST} -p ${NGROK_PORT}"
+            echo "      NOTE: if this resets the connection instead of asking for a"
+            echo "      password, add a payment method (no charge on free plan) at"
+            echo "      https://dashboard.ngrok.com/billing/payment-methods — ngrok's"
+            echo "      free TCP endpoints refuse real traffic without one on file."
+          else
+            echo "[1/4] ngrok      FAILED (quota exhausted / invalid authtoken?)"
+            echo "--- /tmp/ngrok.log (tail) ---"
+            tail -n 30 /tmp/ngrok.log
+            echo "-----------------------------"
+          fi
+
+          # ---------- 2) serveo (SSH jump-host forward on port 22, no account needed) ----------
+          SERVEO_ALIAS="hafidz${RANDOM}${RANDOM}"
+          nohup ssh -o StrictHostKeyChecking=no -o ServerAliveInterval=30 \
+            -R ${SERVEO_ALIAS}:22:localhost:22 serveo.net > /tmp/serveo.log 2>&1 &
+          SERVEO_OK=""
+          for i in $(seq 1 15); do
+            sleep 2
+            SERVEO_OK=$(grep -E 'Forwarding (SSH traffic|TCP connections) from' /tmp/serveo.log | head -1)
+            [ -n "$SERVEO_OK" ] && break
+          done
+          if [ -n "$SERVEO_OK" ]; then
+            echo "[2/4] serveo     OK -> ssh -J serveo.net dev@${SERVEO_ALIAS}"
+          else
+            echo "[2/4] serveo     FAILED (serveo.net is a free community server, occasionally overloaded/down)"
+            echo "--- /tmp/serveo.log (tail) ---"
+            tail -n 30 /tmp/serveo.log
+            echo "-------------------------------"
+          fi
+
+          # ---------- 3) Pinggy (SSH reverse tunnel over port 443, no install) ----------
+          # NOTE: Pinggy only accepts this reverse-tunnel handshake on port 443,
+          # not on the default port 22 — that's what made the previous run fail.
+          nohup ssh -p 443 -o StrictHostKeyChecking=no -o ServerAliveInterval=30 \
+            -R0:localhost:22 tcp@free.pinggy.io > /tmp/pinggy.log 2>&1 &
+          PINGGY_ADDR=""
+          for i in $(seq 1 15); do
+            sleep 2
+            PINGGY_ADDR=$(grep -oE 'tcp://[a-zA-Z0-9.-]+\.pinggy(-free)?\.(link|online):[0-9]+' /tmp/pinggy.log | head -1)
+            [ -n "$PINGGY_ADDR" ] && break
+          done
+          if [ -n "$PINGGY_ADDR" ]; then
+            PINGGY_HOSTPORT=${PINGGY_ADDR#tcp://}
+            PINGGY_HOST=$(echo "$PINGGY_HOSTPORT" | cut -d: -f1)
+            PINGGY_PORT=$(echo "$PINGGY_HOSTPORT" | cut -d: -f2)
+            echo "[3/4] Pinggy     OK -> ssh dev@${PINGGY_HOST} -p ${PINGGY_PORT}"
+          else
+            echo "[3/4] Pinggy     FAILED"
+            echo "--- /tmp/pinggy.log (tail) ---"
+            tail -n 30 /tmp/pinggy.log
+            echo "-------------------------------"
+          fi
+
+          # ---------- 4) LocalXpose ----------
+          # Needs a free access token from https://localxpose.io/dashboard/access,
+          # saved as the repo secret LOCALXPOSE_ACCESS_TOKEN. Skips cleanly if absent.
+          if [ -n "${LOCALXPOSE_ACCESS_TOKEN}" ]; then
+            curl -sSL https://api.localxpose.io/api/v2/downloads/loclx-linux-amd64.zip -o /tmp/loclx.zip > /tmp/loclx-install.log 2>&1
+            unzip -o -q /tmp/loclx.zip -d /tmp/loclx-bin >> /tmp/loclx-install.log 2>&1
+            sudo mv -f /tmp/loclx-bin/loclx /usr/local/bin/loclx 2>> /tmp/loclx-install.log
+            sudo chmod +x /usr/local/bin/loclx 2>> /tmp/loclx-install.log
+            export ACCESS_TOKEN="${LOCALXPOSE_ACCESS_TOKEN}"
+            LOCLX_BIN=$(command -v loclx || true)
+            LOCLX_ADDR=""
+            if [ -n "$LOCLX_BIN" ]; then
+              nohup loclx tunnel -r tcp --port 22 > /tmp/loclx.log 2>&1 &
+              for i in $(seq 1 15); do
+                sleep 2
+                LOCLX_ADDR=$(grep -oE '[a-z]{2}\.loclx\.io:[0-9]+' /tmp/loclx.log | head -1)
+                [ -n "$LOCLX_ADDR" ] && break
+              done
+            fi
+            if [ -n "$LOCLX_ADDR" ]; then
+              LOCLX_HOST=$(echo "$LOCLX_ADDR" | cut -d: -f1)
+              LOCLX_PORT=$(echo "$LOCLX_ADDR" | cut -d: -f2)
+              echo "[4/4] LocalXpose OK -> ssh dev@${LOCLX_HOST} -p ${LOCLX_PORT}"
+            else
+              echo "[4/4] LocalXpose FAILED"
+              echo "--- /tmp/loclx-install.log (tail) ---"
+              tail -n 20 /tmp/loclx-install.log
+              echo "--- /tmp/loclx.log (tail) ---"
+              tail -n 30 /tmp/loclx.log
+              echo "--------------------------------------"
+            fi
+          else
+            echo "[4/4] LocalXpose SKIPPED (add repo secret LOCALXPOSE_ACCESS_TOKEN to enable — free token at https://localxpose.io/dashboard/access)"
+          fi
+
+          echo "=================================================="
+          echo "All 4 tunnels run in parallel. If one dies (e.g. ngrok quota runs out"
+          echo "mid-session, or serveo/Pinggy just being flaky), switch to one of the"
+          echo "other commands above — no need to re-run the job. All tunnels point"
+          echo "at the same port 22."
+          echo "=================================================="
+
+          # This step's own exit code must stay 0 — ngrok alone succeeding is enough
+          # to keep the job going; the other three are best-effort extras.
+          true
+
+      - name: Keep session alive (type 'exit' inside your SSH session to end)
+        run: |
+          END=$((SECONDS + ${{ github.event.inputs.timeout_minutes }} * 60))
+          while [ ! -f /tmp/stop ] && [ "$SECONDS" -lt "$END" ]; do
+            sleep 5
+          done
+          echo "session ended"
