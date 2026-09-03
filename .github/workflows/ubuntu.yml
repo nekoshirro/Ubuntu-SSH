@@ -1,0 +1,237 @@
+name: Ubuntu
+
+on:
+  workflow_dispatch:
+    inputs:
+      timeout_minutes:
+        description: 'Max session duration in minutes (GitHub free public repo hard cap ~360)'
+        required: false
+        default: '350'
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  ssh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install prebuilt tools (git curl make nano openssh-server)
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends \
+            openssh-server git curl make nano unzip
+          git --version; curl --version | head -1; make --version | head -1; nano --version | head -1
+
+      - name: Create isolated login user 'marble'
+        run: |
+          # -m creates a FRESH home at /home/marble (separate from /home/runner,
+          # so /home/runner/work/<repo> workspace files never show up here).
+          sudo useradd -m -s /bin/bash marble
+          PASSWORD=$(openssl rand -base64 9)
+          echo "marble:${PASSWORD}" | sudo chpasswd
+          sudo usermod -aG sudo marble
+          echo "marble ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/marble > /dev/null
+          echo "SSH_PASSWORD=${PASSWORD}" >> "$GITHUB_ENV"
+
+      - name: Force colored prompt for marble
+        run: |
+          # Skel's .bashrc only colors PS1 if it auto-detects a color-capable
+          # TERM, which fails to trigger over some SSH clients -> plain white
+          # prompt. Force it unconditionally instead of relying on detection.
+          #
+          # IMPORTANT: also write it to ~/.profile, not just ~/.bashrc.
+          # ~/.profile is guaranteed to be sourced on every SSH login shell;
+          # whether it in turn sources ~/.bashrc depends on the image's skel
+          # files (this Azure Ubuntu image doesn't reliably do it), so relying
+          # on .bashrc alone silently no-ops. .profile is the safe bet.
+          PROMPT_LINE='export PS1="\[\033[01;32m\]\u@\h\[\033[00m\]:\[\033[01;34m\]\w\[\033[00m\]\$ "'
+
+          sudo -u marble tee -a /home/marble/.bashrc > /dev/null <<EOF
+
+          ${PROMPT_LINE}
+          EOF
+
+          sudo -u marble tee -a /home/marble/.profile > /dev/null <<EOF
+
+          ${PROMPT_LINE}
+          EOF
+
+      - name: Set git identity for marble
+        run: |
+          # -H forces HOME=/home/marble for this command. Without -H, git can end
+          # up reading /home/runner/.gitconfig / /home/runner/.config/git/config,
+          # which marble has no permission to read -> the "permission denied"
+          # warning you were seeing.
+          # cd into marble's own home first — the default cwd for this step is
+          # $GITHUB_WORKSPACE (/home/runner/work/...), which marble can't even
+          # stat, so git fails before it gets to the config command.
+          sudo -H -u marble bash -c 'cd ~ && git config --global user.name "Hafidz Muzakky"'
+          sudo -H -u marble bash -c 'cd ~ && git config --global user.email "ais.muzakky@gmail.com"'
+          sudo -H -u marble bash -c 'cd ~ && git config --global --list'
+
+      - name: Configure sshd for 'marble'
+        run: |
+          sudo mkdir -p /var/run/sshd
+
+          # IMPORTANT: Ubuntu's default sshd_config has:
+          #   Include /etc/ssh/sshd_config.d/*.conf
+          # near the TOP of the file, and that directory already contains
+          # 50-cloudimg-settings.conf with "PasswordAuthentication no".
+          # sshd uses first-match-wins, so appending "yes" to the bottom of
+          # sshd_config (the old approach) was always losing to that file.
+          # Writing our own file that sorts BEFORE it (00-) fixes this for real.
+          {
+            echo "PasswordAuthentication yes"
+            echo "PermitRootLogin no"
+            echo "ClientAliveInterval 30"
+            echo "ClientAliveCountMax 10"
+          } | sudo tee /etc/ssh/sshd_config.d/00-marble.conf > /dev/null
+
+          sudo service ssh restart
+
+      - name: Verify sshd is actually listening locally
+        run: |
+          sudo systemctl status ssh --no-pager || true
+          echo "--- listening sockets ---"
+          ss -tlnp | grep ':22' || echo "sshd is NOT listening on port 22!"
+          echo "--- loopback connect test ---"
+          timeout 5 bash -c '</dev/tcp/127.0.0.1/22' \
+            && echo "OK: local port 22 accepts connections" \
+            || echo "FAILED: local port 22 refused/timed out — none of the tunnels will work if this fails"
+          echo "--- effective PasswordAuthentication setting ---"
+          sudo sshd -T | grep -i passwordauthentication
+
+      - name: Make 'exit' reliably end the whole session
+        run: |
+          # ~/.bash_logout runs when a LOGIN shell exits (i.e. you type `exit`
+          # in your ssh session) — this is the correct hook, unlike an EXIT
+          # trap stuffed into .bashrc (which fires inconsistently depending on
+          # login vs non-login / interactive vs not, especially with 3 tunnels
+          # potentially spawning multiple shells).
+          sudo -u marble tee -a /home/marble/.bash_logout > /dev/null <<'EOF'
+          touch /tmp/stop
+          EOF
+
+      - name: Install ngrok
+        run: |
+          curl -sSL https://ngrok-agent.s3.amazonaws.com/ngrok.asc \
+            | sudo tee /etc/apt/trusted.gpg.d/ngrok.asc > /dev/null
+          echo "deb https://ngrok-agent.s3.amazonaws.com buster main" \
+            | sudo tee /etc/apt/sources.list.d/ngrok.list
+          sudo apt-get update -y
+          sudo apt-get install -y ngrok
+          ngrok config add-authtoken "${{ secrets.NGROK_AUTHTOKEN }}"
+
+      - name: Open 3 parallel tunnels (ngrok + serveo + Pinggy)
+        run: |
+          set +e +o pipefail
+
+          echo "=================================================="
+          echo "User    : marble"
+          echo "Password: ${SSH_PASSWORD}"
+          echo "=================================================="
+
+          # ---------- 1) ngrok ----------
+          nohup ngrok tcp 22 --log stdout > /tmp/ngrok.log 2>&1 &
+          NGROK_ADDR=""
+          for i in $(seq 1 15); do
+            sleep 2
+            NGROK_ADDR=$(curl -s http://127.0.0.1:4040/api/tunnels | grep -o '"public_url":"tcp://[^"]*' | cut -d'/' -f3)
+            [ -n "$NGROK_ADDR" ] && break
+          done
+          if [ -n "$NGROK_ADDR" ]; then
+            NGROK_HOST=$(echo "$NGROK_ADDR" | cut -d: -f1)
+            NGROK_PORT=$(echo "$NGROK_ADDR" | cut -d: -f2)
+            echo "[1/3] ngrok      OK -> ssh marble@${NGROK_HOST} -p ${NGROK_PORT}"
+            echo "      NOTE: if this resets the connection instead of asking for a"
+            echo "      password, add a payment method (no charge on free plan) at"
+            echo "      https://dashboard.ngrok.com/billing/payment-methods — ngrok's"
+            echo "      free TCP endpoints refuse real traffic without one on file."
+          else
+            echo "[1/3] ngrok      FAILED (quota exhausted / invalid authtoken?)"
+            echo "--- /tmp/ngrok.log (tail) ---"
+            tail -n 30 /tmp/ngrok.log
+            echo "-----------------------------"
+          fi
+
+          # ---------- 2) serveo (SSH jump-host forward on port 22, no account needed) ----------
+          SERVEO_ALIAS="hafidz${RANDOM}${RANDOM}"
+          nohup ssh -o StrictHostKeyChecking=no -o ServerAliveInterval=30 \
+            -R ${SERVEO_ALIAS}:22:localhost:22 serveo.net > /tmp/serveo.log 2>&1 &
+          SERVEO_OK=""
+          for i in $(seq 1 15); do
+            sleep 2
+            SERVEO_OK=$(grep -E 'Forwarding (SSH traffic|TCP connections) from' /tmp/serveo.log | head -1)
+            [ -n "$SERVEO_OK" ] && break
+          done
+          if [ -n "$SERVEO_OK" ]; then
+            echo "[2/3] serveo     OK -> ssh -J serveo.net marble@${SERVEO_ALIAS}"
+          else
+            echo "[2/3] serveo     FAILED (serveo.net is a free community server, occasionally overloaded/down)"
+            echo "--- /tmp/serveo.log (tail) ---"
+            tail -n 30 /tmp/serveo.log
+            echo "-------------------------------"
+          fi
+
+          # ---------- 3) Pinggy (SSH reverse tunnel over port 443, no install) ----------
+          nohup ssh -p 443 -o StrictHostKeyChecking=no -o ServerAliveInterval=30 \
+            -R0:localhost:22 tcp@free.pinggy.io > /tmp/pinggy.log 2>&1 &
+          PINGGY_ADDR=""
+          for i in $(seq 1 15); do
+            sleep 2
+            PINGGY_ADDR=$(grep -oE 'tcp://[a-zA-Z0-9.-]+\.pinggy(-free)?\.(link|online):[0-9]+' /tmp/pinggy.log | head -1)
+            [ -n "$PINGGY_ADDR" ] && break
+          done
+          if [ -n "$PINGGY_ADDR" ]; then
+            PINGGY_HOSTPORT=${PINGGY_ADDR#tcp://}
+            PINGGY_HOST=$(echo "$PINGGY_HOSTPORT" | cut -d: -f1)
+            PINGGY_PORT=$(echo "$PINGGY_HOSTPORT" | cut -d: -f2)
+            echo "[3/3] Pinggy     OK -> ssh marble@${PINGGY_HOST} -p ${PINGGY_PORT}"
+          else
+            echo "[3/3] Pinggy     FAILED"
+            echo "--- /tmp/pinggy.log (tail) ---"
+            tail -n 30 /tmp/pinggy.log
+            echo "-------------------------------"
+          fi
+
+          echo "=================================================="
+          echo "All 3 tunnels run in parallel. If one dies (e.g. ngrok quota runs out"
+          echo "mid-session, or serveo/Pinggy just being flaky), switch to one of the"
+          echo "other commands above — no need to re-run the job. All tunnels point"
+          echo "at the same port 22."
+          echo "=================================================="
+
+          true
+
+      - name: Keep session alive (type 'exit' inside your SSH session to end)
+        run: |
+          END=$((SECONDS + ${{ github.event.inputs.timeout_minutes }} * 60))
+          HAD_SESSION=0
+
+          while [ "$SECONDS" -lt "$END" ]; do
+            # Primary signal: ~/.bash_logout touched /tmp/stop on `exit`.
+            if [ -f /tmp/stop ]; then
+              echo "stop marker found (exit was typed) — ending session"
+              break
+            fi
+
+            # Fallback signal: if marble had at least one active sshd session
+            # and now has zero, the connection dropped/closed — end the job
+            # too, instead of hanging for the full timeout.
+            ACTIVE=$(pgrep -u marble -f "sshd: marble@" | wc -l || true)
+            if [ "$ACTIVE" -gt 0 ]; then
+              HAD_SESSION=1
+            elif [ "$HAD_SESSION" -eq 1 ]; then
+              echo "marble's ssh session closed — ending session"
+              break
+            fi
+
+            sleep 5
+          done
+
+          echo "session ended"
