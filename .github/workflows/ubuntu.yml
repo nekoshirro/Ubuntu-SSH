@@ -182,10 +182,10 @@ jobs:
             LOCLX_BIN=$(command -v loclx || true)
             LOCLX_ADDR=""
             if [ -n "$LOCLX_BIN" ]; then
-              nohup loclx tunnel -r tcp --port 22 > /tmp/loclx.log 2>&1 &
+              nohup loclx tunnel tcp --to localhost:22 > /tmp/loclx.log 2>&1 &
               for i in $(seq 1 15); do
                 sleep 2
-                LOCLX_ADDR=$(grep -oE '[a-z]{2}\.loclx\.io:[0-9]+' /tmp/loclx.log | head -1)
+                LOCLX_ADDR=$(grep -oE '[a-zA-Z0-9.-]+\.loclx\.io:[0-9]+' /tmp/loclx.log | head -1)
                 [ -n "$LOCLX_ADDR" ] && break
               done
             fi
