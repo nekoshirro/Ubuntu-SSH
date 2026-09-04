@@ -36,17 +36,17 @@ jobs:
       - name: Create a clean login user + configure sshd
         run: |
           sudo mkdir -p /var/run/sshd
-          PASSWORD=$(openssl rand -base64 15)
+          PASSWORD=$(openssl rand -base64 9)
 
           # Fresh user with a truly empty home, isolated from the actions-runner's
           # own files (avoids inheriting /home/runner/work/... clutter).
-          sudo useradd -m -s /bin/bash dev
-          echo "dev:${PASSWORD}" | sudo chpasswd
-          sudo usermod -aG sudo dev
-          echo "dev ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/dev > /dev/null
+          sudo useradd -m -s /bin/bash runner
+          echo "runner:${PASSWORD}" | sudo chpasswd
+          sudo usermod -aG sudo runner
+          echo "runner ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/runner > /dev/null
           # useradd -m only seeds dotfiles from /etc/skel; strip anything extra so
           # the very first `ls -la` after login shows an empty directory.
-          sudo find /home/dev -mindepth 1 -maxdepth 1 ! -name '.bashrc' ! -name '.profile' \
+          sudo find /home/runner -mindepth 1 -maxdepth 1 ! -name '.bashrc' ! -name '.profile' \
             -exec rm -rf {} +
 
           {
@@ -73,12 +73,12 @@ jobs:
           # When the interactive login shell exits (type `exit`, Ctrl-D, or the
           # terminal just closes), this trap drops /tmp/stop, which the
           # "Keep session alive" step below is polling for.
-          sudo tee -a /home/dev/.bashrc > /dev/null <<'EOF'
+          sudo tee -a /home/runner/.bashrc > /dev/null <<'EOF'
 
           # Ending this SSH session stops the whole GitHub Actions job.
           trap 'touch /tmp/stop' EXIT
           EOF
-          sudo chown dev:dev /home/dev/.bashrc
+          sudo chown runner:runner /home/runner/.bashrc
 
       - name: Install ngrok
         run: |
@@ -90,7 +90,7 @@ jobs:
           sudo apt-get install -y ngrok
           ngrok config add-authtoken "${{ secrets.NGROK_AUTHTOKEN }}"
 
-      - name: Open 4 parallel tunnels (ngrok + serveo + Pinggy + bore.pub)
+      - name: Open 3 parallel tunnels (ngrok + serveo + Pinggy)
         run: |
           # GitHub Actions runs bash with `-e -o pipefail` by default, so a single
           # `grep` that finds no match (very normal while we're still polling)
@@ -99,7 +99,7 @@ jobs:
           set +e +o pipefail
 
           echo "=================================================="
-          echo "User    : dev"
+          echo "User    : runner"
           echo "Password: ${SSH_PASSWORD}"
           echo "=================================================="
 
@@ -114,13 +114,13 @@ jobs:
           if [ -n "$NGROK_ADDR" ]; then
             NGROK_HOST=$(echo "$NGROK_ADDR" | cut -d: -f1)
             NGROK_PORT=$(echo "$NGROK_ADDR" | cut -d: -f2)
-            echo "[1/4] ngrok      OK -> ssh dev@${NGROK_HOST} -p ${NGROK_PORT}"
+            echo "[1/3] ngrok      OK -> ssh runner@${NGROK_HOST} -p ${NGROK_PORT}"
             echo "      NOTE: if this resets the connection instead of asking for a"
             echo "      password, add a payment method (no charge on free plan) at"
             echo "      https://dashboard.ngrok.com/billing/payment-methods — ngrok's"
             echo "      free TCP endpoints refuse real traffic without one on file."
           else
-            echo "[1/4] ngrok      FAILED (quota exhausted / invalid authtoken?)"
+            echo "[1/3] ngrok      FAILED (quota exhausted / invalid authtoken?)"
             echo "--- /tmp/ngrok.log (tail) ---"
             tail -n 30 /tmp/ngrok.log
             echo "-----------------------------"
@@ -137,9 +137,9 @@ jobs:
             [ -n "$SERVEO_OK" ] && break
           done
           if [ -n "$SERVEO_OK" ]; then
-            echo "[2/4] serveo     OK -> ssh -J serveo.net dev@${SERVEO_ALIAS}"
+            echo "[2/3] serveo     OK -> ssh -J serveo.net runner@${SERVEO_ALIAS}"
           else
-            echo "[2/4] serveo     FAILED (serveo.net is a free community server, occasionally overloaded/down)"
+            echo "[2/3] serveo     FAILED (serveo.net is a free community server, occasionally overloaded/down)"
             echo "--- /tmp/serveo.log (tail) ---"
             tail -n 30 /tmp/serveo.log
             echo "-------------------------------"
@@ -160,51 +160,23 @@ jobs:
             PINGGY_HOSTPORT=${PINGGY_ADDR#tcp://}
             PINGGY_HOST=$(echo "$PINGGY_HOSTPORT" | cut -d: -f1)
             PINGGY_PORT=$(echo "$PINGGY_HOSTPORT" | cut -d: -f2)
-            echo "[3/4] Pinggy     OK -> ssh dev@${PINGGY_HOST} -p ${PINGGY_PORT}"
+            echo "[3/3] Pinggy     OK -> ssh runner@${PINGGY_HOST} -p ${PINGGY_PORT}"
           else
-            echo "[3/4] Pinggy     FAILED"
+            echo "[3/3] Pinggy     FAILED"
             echo "--- /tmp/pinggy.log (tail) ---"
             tail -n 30 /tmp/pinggy.log
             echo "-------------------------------"
           fi
 
-          # ---------- 4) bore.pub (free TCP tunnel, no account/token needed) ----------
-          # LocalXpose's TCP tunnels moved behind a PRO paywall, so swapped in
-          # bore (https://github.com/ekzhang/bore) against the public bore.pub relay.
-          curl -sSL https://github.com/ekzhang/bore/releases/latest/download/bore-x86_64-unknown-linux-musl.tar.gz \
-            -o /tmp/bore.tar.gz > /tmp/bore-install.log 2>&1
-          sudo tar -xzf /tmp/bore.tar.gz -C /usr/local/bin bore 2>> /tmp/bore-install.log
-          sudo chmod +x /usr/local/bin/bore 2>> /tmp/bore-install.log
-          BORE_BIN=$(command -v bore || true)
-          BORE_ADDR=""
-          if [ -n "$BORE_BIN" ]; then
-            nohup bore local 22 --to bore.pub > /tmp/bore.log 2>&1 &
-            for i in $(seq 1 15); do
-              sleep 2
-              BORE_ADDR=$(grep -oE 'remote_port=[0-9]+' /tmp/bore.log | head -1 | cut -d= -f2)
-              [ -n "$BORE_ADDR" ] && break
-            done
-          fi
-          if [ -n "$BORE_ADDR" ]; then
-            echo "[4/4] bore.pub   OK -> ssh dev@bore.pub -p ${BORE_ADDR}"
-          else
-            echo "[4/4] bore.pub   FAILED"
-            echo "--- /tmp/bore-install.log (tail) ---"
-            tail -n 20 /tmp/bore-install.log
-            echo "--- /tmp/bore.log (tail) ---"
-            tail -n 30 /tmp/bore.log
-            echo "-------------------------------------"
-          fi
-
           echo "=================================================="
-          echo "All 4 tunnels run in parallel. If one dies (e.g. ngrok quota runs out"
+          echo "All 3 tunnels run in parallel. If one dies (e.g. ngrok quota runs out"
           echo "mid-session, or serveo/Pinggy just being flaky), switch to one of the"
           echo "other commands above — no need to re-run the job. All tunnels point"
           echo "at the same port 22."
           echo "=================================================="
 
           # This step's own exit code must stay 0 — ngrok alone succeeding is enough
-          # to keep the job going; the other three are best-effort extras.
+          # to keep the job going; the other two are best-effort extras.
           true
 
       - name: Keep session alive (type 'exit' inside your SSH session to end)
