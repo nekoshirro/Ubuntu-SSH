@@ -90,9 +90,7 @@ jobs:
           sudo apt-get install -y ngrok
           ngrok config add-authtoken "${{ secrets.NGROK_AUTHTOKEN }}"
 
-      - name: Open 4 parallel tunnels (ngrok + serveo + Pinggy + LocalXpose)
-        env:
-          LOCALXPOSE_ACCESS_TOKEN: ${{ secrets.LOCALXPOSE_ACCESS_TOKEN }}
+      - name: Open 4 parallel tunnels (ngrok + serveo + Pinggy + bore.pub)
         run: |
           # GitHub Actions runs bash with `-e -o pipefail` by default, so a single
           # `grep` that finds no match (very normal while we're still polling)
@@ -170,39 +168,32 @@ jobs:
             echo "-------------------------------"
           fi
 
-          # ---------- 4) LocalXpose ----------
-          # Needs a free access token from https://localxpose.io/dashboard/access,
-          # saved as the repo secret LOCALXPOSE_ACCESS_TOKEN. Skips cleanly if absent.
-          if [ -n "${LOCALXPOSE_ACCESS_TOKEN}" ]; then
-            curl -sSL https://api.localxpose.io/api/v2/downloads/loclx-linux-amd64.zip -o /tmp/loclx.zip > /tmp/loclx-install.log 2>&1
-            unzip -o -q /tmp/loclx.zip -d /tmp/loclx-bin >> /tmp/loclx-install.log 2>&1
-            sudo mv -f /tmp/loclx-bin/loclx /usr/local/bin/loclx 2>> /tmp/loclx-install.log
-            sudo chmod +x /usr/local/bin/loclx 2>> /tmp/loclx-install.log
-            export ACCESS_TOKEN="${LOCALXPOSE_ACCESS_TOKEN}"
-            LOCLX_BIN=$(command -v loclx || true)
-            LOCLX_ADDR=""
-            if [ -n "$LOCLX_BIN" ]; then
-              nohup loclx tunnel tcp --to localhost:22 > /tmp/loclx.log 2>&1 &
-              for i in $(seq 1 15); do
-                sleep 2
-                LOCLX_ADDR=$(grep -oE '[a-zA-Z0-9.-]+\.loclx\.io:[0-9]+' /tmp/loclx.log | head -1)
-                [ -n "$LOCLX_ADDR" ] && break
-              done
-            fi
-            if [ -n "$LOCLX_ADDR" ]; then
-              LOCLX_HOST=$(echo "$LOCLX_ADDR" | cut -d: -f1)
-              LOCLX_PORT=$(echo "$LOCLX_ADDR" | cut -d: -f2)
-              echo "[4/4] LocalXpose OK -> ssh dev@${LOCLX_HOST} -p ${LOCLX_PORT}"
-            else
-              echo "[4/4] LocalXpose FAILED"
-              echo "--- /tmp/loclx-install.log (tail) ---"
-              tail -n 20 /tmp/loclx-install.log
-              echo "--- /tmp/loclx.log (tail) ---"
-              tail -n 30 /tmp/loclx.log
-              echo "--------------------------------------"
-            fi
+          # ---------- 4) bore.pub (free TCP tunnel, no account/token needed) ----------
+          # LocalXpose's TCP tunnels moved behind a PRO paywall, so swapped in
+          # bore (https://github.com/ekzhang/bore) against the public bore.pub relay.
+          curl -sSL https://github.com/ekzhang/bore/releases/latest/download/bore-x86_64-unknown-linux-musl.tar.gz \
+            -o /tmp/bore.tar.gz > /tmp/bore-install.log 2>&1
+          sudo tar -xzf /tmp/bore.tar.gz -C /usr/local/bin bore 2>> /tmp/bore-install.log
+          sudo chmod +x /usr/local/bin/bore 2>> /tmp/bore-install.log
+          BORE_BIN=$(command -v bore || true)
+          BORE_ADDR=""
+          if [ -n "$BORE_BIN" ]; then
+            nohup bore local 22 --to bore.pub > /tmp/bore.log 2>&1 &
+            for i in $(seq 1 15); do
+              sleep 2
+              BORE_ADDR=$(grep -oE 'remote_port=[0-9]+' /tmp/bore.log | head -1 | cut -d= -f2)
+              [ -n "$BORE_ADDR" ] && break
+            done
+          fi
+          if [ -n "$BORE_ADDR" ]; then
+            echo "[4/4] bore.pub   OK -> ssh dev@bore.pub -p ${BORE_ADDR}"
           else
-            echo "[4/4] LocalXpose SKIPPED (add repo secret LOCALXPOSE_ACCESS_TOKEN to enable — free token at https://localxpose.io/dashboard/access)"
+            echo "[4/4] bore.pub   FAILED"
+            echo "--- /tmp/bore-install.log (tail) ---"
+            tail -n 20 /tmp/bore-install.log
+            echo "--- /tmp/bore.log (tail) ---"
+            tail -n 30 /tmp/bore.log
+            echo "-------------------------------------"
           fi
 
           echo "=================================================="
