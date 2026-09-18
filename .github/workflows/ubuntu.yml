@@ -12,90 +12,125 @@ defaults:
   run:
     shell: bash
 
+# ------------------------------------------------------------------
+# DESIGN NOTE (why only 3 named steps below):
+# GitHub always injects "Set up job" and "Complete job" itself — those
+# 2 stages are not ours to remove. We also dropped `actions/checkout`
+# entirely: nothing in this job ever reads the repo's files, and that
+# action carries a hidden "Post Checkout" cleanup stage. Removing an
+# unused action is a free stage, not a workaround.
+# Total visible stages = Set up job + 3 steps + Complete job = 5.
+# ------------------------------------------------------------------
+
 jobs:
   ssh:
     runs-on: ubuntu-latest
     timeout-minutes: 360
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Install prebuilt tools (git curl make nano openssh-server)
+      # ================================================================
+      # STAGE 2/5 — Packages, ngrok binary, and the 'runner' user itself
+      # (password, colored prompt, git identity, persistent git creds,
+      # exit trap). Everything here is idempotent config on the SAME
+      # user GitHub already gave us — no useradd, no sudo -u juggling,
+      # no permission mismatches between /home/runner and the workspace.
+      # ================================================================
+      - name: Install tools & configure the 'runner' account
         run: |
           sudo apt-get update -y
           sudo apt-get install -y --no-install-recommends \
             openssh-server git curl make nano unzip
           git --version; curl --version | head -1; make --version | head -1; nano --version | head -1
 
-      - name: Create isolated login user 'marble'
-        run: |
-          # -m creates a FRESH home at /home/marble (separate from /home/runner,
-          # so /home/runner/work/<repo> workspace files never show up here).
-          sudo useradd -m -s /bin/bash marble
+          # --- ngrok binary (own apt repo, needs its own `update`) ---
+          curl -sSL https://ngrok-agent.s3.amazonaws.com/ngrok.asc \
+            | sudo tee /etc/apt/trusted.gpg.d/ngrok.asc > /dev/null
+          echo "deb https://ngrok-agent.s3.amazonaws.com buster main" \
+            | sudo tee /etc/apt/sources.list.d/ngrok.list
+          sudo apt-get update -y
+          sudo apt-get install -y ngrok
+          ngrok config add-authtoken "${{ secrets.NGROK_AUTHTOKEN }}"
+
+          # --- Give the EXISTING 'runner' user an SSH password ---
+          # 'runner' already has passwordless sudo baked into the image;
+          # we only need a login password since we're using
+          # PasswordAuthentication (not key-based) below.
           PASSWORD=$(openssl rand -base64 9)
-          echo "marble:${PASSWORD}" | sudo chpasswd
-          sudo usermod -aG sudo marble
-          echo "marble ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/marble > /dev/null
+          echo "runner:${PASSWORD}" | sudo chpasswd
           echo "SSH_PASSWORD=${PASSWORD}" >> "$GITHUB_ENV"
 
-      - name: Force colored prompt for marble
-        run: |
-          # Skel's .bashrc only colors PS1 if it auto-detects a color-capable
-          # TERM, which fails to trigger over some SSH clients -> plain white
-          # prompt. Force it unconditionally instead of relying on detection.
-          #
-          # IMPORTANT: also write it to ~/.profile, not just ~/.bashrc.
-          # ~/.profile is guaranteed to be sourced on every SSH login shell;
-          # whether it in turn sources ~/.bashrc depends on the image's skel
-          # files (this Azure Ubuntu image doesn't reliably do it), so relying
-          # on .bashrc alone silently no-ops. .profile is the safe bet.
+          # --- Colored prompt, forced instead of auto-detected ---
+          # Mechanism (see chat for the full explanation): the green
+          # "user@host" you see is ANSI color codes emitted by PS1,
+          # which is set SERVER-side (in .bashrc/.profile) — your local
+          # terminal/tmux only has to be *capable* of rendering ANSI,
+          # it doesn't invent the colors itself. Ubuntu's stock .bashrc
+          # only turns color on if it recognizes $TERM, and that
+          # detection breaks across some SSH clients / jump hosts, so
+          # we bypass detection and force it. We also give TERM itself
+          # a safe fallback so nano/less behave if a client sends none.
           PROMPT_LINE='export PS1="\[\033[01;32m\]\u@\h\[\033[00m\]:\[\033[01;34m\]\w\[\033[00m\]\$ "'
+          for f in /home/runner/.bashrc /home/runner/.profile; do
+            {
+              echo ''
+              echo ': "${TERM:=xterm-256color}"; export TERM'
+              echo "${PROMPT_LINE}"
+            } >> "$f"
+          done
 
-          sudo -u marble tee -a /home/marble/.bashrc > /dev/null <<EOF
+          # --- Git identity ---
+          git config --global user.name "Hafidz Muzakky"
+          git config --global user.email "ais.muzakky@gmail.com"
+          git config --global --list
 
-          ${PROMPT_LINE}
-          EOF
+          # --- Persistent git credentials (no token prompt on push) ---
+          # `credential.helper store` keeps a plaintext token in
+          # ~/.git-credentials for the life of THIS session. Because the
+          # VM is fresh every run, that file itself doesn't survive
+          # between workflow runs — but seeding it automatically from a
+          # repo secret every run means YOU never have to type a token
+          # inside any given SSH session. Add a secret named GH_PAT
+          # (Settings > Secrets and variables > Actions) containing a
+          # Personal Access Token with `repo` scope to enable this.
+          git config --global credential.helper store
+          if [ -n "${{ secrets.GH_PAT }}" ]; then
+            echo "https://${{ secrets.GH_PAT }}:x-oauth-basic@github.com" > /home/runner/.git-credentials
+            chmod 600 /home/runner/.git-credentials
+            echo "git-credential-store seeded from GH_PAT — pushes over HTTPS won't ask for a token."
+          else
+            echo "NOTE: no GH_PAT secret found. Add one to auto-seed credentials next run;"
+            echo "      until then you'll be prompted for a token on the first push."
+          fi
 
-          sudo -u marble tee -a /home/marble/.profile > /dev/null <<EOF
+          # --- Make 'exit' end the whole job, not just the shell ---
+          # ~/.bash_logout fires on LOGIN shell exit (i.e. you typing
+          # `exit`), unlike an EXIT trap in .bashrc which fires
+          # inconsistently across login/non-login and the 3 parallel
+          # tunnels below.
+          echo 'touch /tmp/stop' >> /home/runner/.bash_logout
 
-          ${PROMPT_LINE}
-          EOF
-
-      - name: Set git identity for marble
-        run: |
-          # -H forces HOME=/home/marble for this command. Without -H, git can end
-          # up reading /home/runner/.gitconfig / /home/runner/.config/git/config,
-          # which marble has no permission to read -> the "permission denied"
-          # warning you were seeing.
-          # cd into marble's own home first — the default cwd for this step is
-          # $GITHUB_WORKSPACE (/home/runner/work/...), which marble can't even
-          # stat, so git fails before it gets to the config command.
-          sudo -H -u marble bash -c 'cd ~ && git config --global user.name "Hafidz Muzakky"'
-          sudo -H -u marble bash -c 'cd ~ && git config --global user.email "ais.muzakky@gmail.com"'
-          sudo -H -u marble bash -c 'cd ~ && git config --global --list'
-
-      - name: Configure sshd for 'marble'
+      # ================================================================
+      # STAGE 3/5 — sshd: configure it, then verify it's actually up
+      # before we bother opening any tunnels.
+      # ================================================================
+      - name: Configure & verify sshd
         run: |
           sudo mkdir -p /var/run/sshd
 
-          # IMPORTANT: Ubuntu's default sshd_config has:
+          # IMPORTANT: Ubuntu's default sshd_config does
           #   Include /etc/ssh/sshd_config.d/*.conf
-          # near the TOP of the file, and that directory already contains
-          # 50-cloudimg-settings.conf with "PasswordAuthentication no".
-          # sshd uses first-match-wins, so appending "yes" to the bottom of
-          # sshd_config (the old approach) was always losing to that file.
-          # Writing our own file that sorts BEFORE it (00-) fixes this for real.
+          # near the TOP, and 50-cloudimg-settings.conf in that dir
+          # already sets "PasswordAuthentication no". sshd is
+          # first-match-wins, so a file sorting BEFORE it (00-) is
+          # required for our "yes" to actually win.
           {
             echo "PasswordAuthentication yes"
             echo "PermitRootLogin no"
             echo "ClientAliveInterval 30"
             echo "ClientAliveCountMax 10"
-          } | sudo tee /etc/ssh/sshd_config.d/00-marble.conf > /dev/null
+          } | sudo tee /etc/ssh/sshd_config.d/00-runner.conf > /dev/null
 
           sudo service ssh restart
 
-      - name: Verify sshd is actually listening locally
-        run: |
           sudo systemctl status ssh --no-pager || true
           echo "--- listening sockets ---"
           ss -tlnp | grep ':22' || echo "sshd is NOT listening on port 22!"
@@ -106,38 +141,25 @@ jobs:
           echo "--- effective PasswordAuthentication setting ---"
           sudo sshd -T | grep -i passwordauthentication
 
-      - name: Make 'exit' reliably end the whole session
-        run: |
-          # ~/.bash_logout runs when a LOGIN shell exits (i.e. you type `exit`
-          # in your ssh session) — this is the correct hook, unlike an EXIT
-          # trap stuffed into .bashrc (which fires inconsistently depending on
-          # login vs non-login / interactive vs not, especially with 3 tunnels
-          # potentially spawning multiple shells).
-          sudo -u marble tee -a /home/marble/.bash_logout > /dev/null <<'EOF'
-          touch /tmp/stop
-          EOF
-
-      - name: Install ngrok
-        run: |
-          curl -sSL https://ngrok-agent.s3.amazonaws.com/ngrok.asc \
-            | sudo tee /etc/apt/trusted.gpg.d/ngrok.asc > /dev/null
-          echo "deb https://ngrok-agent.s3.amazonaws.com buster main" \
-            | sudo tee /etc/apt/sources.list.d/ngrok.list
-          sudo apt-get update -y
-          sudo apt-get install -y ngrok
-          ngrok config add-authtoken "${{ secrets.NGROK_AUTHTOKEN }}"
-
-      - name: Open 3 parallel tunnels (ngrok + serveo + Pinggy)
+      # ================================================================
+      # STAGE 4/5 — Open all 3 tunnels, print a rough latency reading
+      # for each, then hold the job open until you type `exit`.
+      # ================================================================
+      - name: Open tunnels, check latency, keep session alive
         run: |
           set +e +o pipefail
 
           echo "=================================================="
-          echo "User    : marble"
+          echo "User    : runner"
           echo "Password: ${SSH_PASSWORD}"
           echo "=================================================="
 
           # ---------- 1) ngrok ----------
-          nohup ngrok tcp 22 --log stdout > /tmp/ngrok.log 2>&1 &
+          # --region ap = Singapore edge. For an Indonesia-based client
+          # this is the single biggest latency lever we control here —
+          # ngrok's default/nearest-to-runner region would otherwise be
+          # US/EU, adding 150-250ms+ versus ~20-60ms via ap.
+          nohup ngrok tcp 22 --region ap --log stdout > /tmp/ngrok.log 2>&1 &
           NGROK_ADDR=""
           for i in $(seq 1 15); do
             sleep 2
@@ -147,19 +169,16 @@ jobs:
           if [ -n "$NGROK_ADDR" ]; then
             NGROK_HOST=$(echo "$NGROK_ADDR" | cut -d: -f1)
             NGROK_PORT=$(echo "$NGROK_ADDR" | cut -d: -f2)
-            echo "[1/3] ngrok      OK -> ssh marble@${NGROK_HOST} -p ${NGROK_PORT}"
-            echo "      NOTE: if this resets the connection instead of asking for a"
-            echo "      password, add a payment method (no charge on free plan) at"
-            echo "      https://dashboard.ngrok.com/billing/payment-methods — ngrok's"
-            echo "      free TCP endpoints refuse real traffic without one on file."
+            echo "[1/3] ngrok      OK -> ssh runner@${NGROK_HOST} -p ${NGROK_PORT}"
+            echo "      NOTE: free TCP endpoints reset instead of prompting for a"
+            echo "      password unless a payment method is on file (no charge on"
+            echo "      free plan): https://dashboard.ngrok.com/billing/payment-methods"
           else
             echo "[1/3] ngrok      FAILED (quota exhausted / invalid authtoken?)"
-            echo "--- /tmp/ngrok.log (tail) ---"
             tail -n 30 /tmp/ngrok.log
-            echo "-----------------------------"
           fi
 
-          # ---------- 2) serveo (SSH jump-host forward on port 22, no account needed) ----------
+          # ---------- 2) serveo (SSH jump-host forward, no account needed) ----------
           SERVEO_ALIAS="hafidz${RANDOM}${RANDOM}"
           nohup ssh -o StrictHostKeyChecking=no -o ServerAliveInterval=30 \
             -R ${SERVEO_ALIAS}:22:localhost:22 serveo.net > /tmp/serveo.log 2>&1 &
@@ -170,12 +189,10 @@ jobs:
             [ -n "$SERVEO_OK" ] && break
           done
           if [ -n "$SERVEO_OK" ]; then
-            echo "[2/3] serveo     OK -> ssh -J serveo.net marble@${SERVEO_ALIAS}"
+            echo "[2/3] serveo     OK -> ssh -J serveo.net runner@${SERVEO_ALIAS}"
           else
-            echo "[2/3] serveo     FAILED (serveo.net is a free community server, occasionally overloaded/down)"
-            echo "--- /tmp/serveo.log (tail) ---"
+            echo "[2/3] serveo     FAILED (free community server, occasionally overloaded/down)"
             tail -n 30 /tmp/serveo.log
-            echo "-------------------------------"
           fi
 
           # ---------- 3) Pinggy (SSH reverse tunnel over port 443, no install) ----------
@@ -191,43 +208,65 @@ jobs:
             PINGGY_HOSTPORT=${PINGGY_ADDR#tcp://}
             PINGGY_HOST=$(echo "$PINGGY_HOSTPORT" | cut -d: -f1)
             PINGGY_PORT=$(echo "$PINGGY_HOSTPORT" | cut -d: -f2)
-            echo "[3/3] Pinggy     OK -> ssh marble@${PINGGY_HOST} -p ${PINGGY_PORT}"
+            echo "[3/3] Pinggy     OK -> ssh runner@${PINGGY_HOST} -p ${PINGGY_PORT}"
           else
             echo "[3/3] Pinggy     FAILED"
-            echo "--- /tmp/pinggy.log (tail) ---"
             tail -n 30 /tmp/pinggy.log
-            echo "-------------------------------"
           fi
 
+          # ---------- Latency reading (IMPORTANT CAVEAT — read it) ----------
+          # This measures RUNNER -> tunnel-endpoint TCP handshake time.
+          # The runner sits in a GitHub/Azure US or EU datacenter, so
+          # this number is NOT what you'll feel typing from Indonesia —
+          # it can only be measured from a host actually in ID. Treat
+          # these as a sanity check that each tunnel is reachable at
+          # all, not as your real experienced latency.
           echo "=================================================="
-          echo "All 3 tunnels run in parallel. If one dies (e.g. ngrok quota runs out"
-          echo "mid-session, or serveo/Pinggy just being flaky), switch to one of the"
-          echo "other commands above — no need to re-run the job. All tunnels point"
-          echo "at the same port 22."
+          echo "Latency (measured FROM THE RUNNER, not from Indonesia):"
+          for entry in "ngrok:${NGROK_HOST:-}:${NGROK_PORT:-}" \
+                       "pinggy:${PINGGY_HOST:-}:${PINGGY_PORT:-}"; do
+            name=${entry%%:*}; rest=${entry#*:}; host=${rest%%:*}; port=${rest##*:}
+            if [ -n "$host" ] && [ -n "$port" ]; then
+              t0=$(date +%s%N)
+              timeout 3 bash -c "</dev/tcp/${host}/${port}" 2>/dev/null
+              rc=$?
+              t1=$(date +%s%N)
+              if [ $rc -eq 0 ]; then
+                echo "  ${name}: $(( (t1 - t0) / 1000000 )) ms (runner-side handshake)"
+              else
+                echo "  ${name}: connect failed, skipped"
+              fi
+            fi
+          done
+          echo "  serveo: skipped (jump-host mode, no plain TCP connect to time)"
+          echo ""
+          echo "For a number that actually matters: once connected, run"
+          echo "  ping <the-host-above>"
+          echo "from YOUR machine in Indonesia. As a rule of thumb, ngrok's ap"
+          echo "(Singapore) region should land lowest for you; serveo/Pinggy's"
+          echo "free tier gives no region choice, so their latency is whatever"
+          echo "their nearest anycast/PoP happens to be that day."
           echo "=================================================="
 
-          true
-
-      - name: Keep session alive (type 'exit' inside your SSH session to end)
-        run: |
+          # ---------- Now block in THIS SAME step until you exit ----------
+          # Tunnels above are backgrounded (nohup + &), so the script
+          # keeps running right into the wait-loop below instead of the
+          # step ending — that's what keeps this one step covering both
+          # "open tunnels" and "hold the session open".
           END=$((SECONDS + ${{ github.event.inputs.timeout_minutes }} * 60))
           HAD_SESSION=0
 
           while [ "$SECONDS" -lt "$END" ]; do
-            # Primary signal: ~/.bash_logout touched /tmp/stop on `exit`.
             if [ -f /tmp/stop ]; then
               echo "stop marker found (exit was typed) — ending session"
               break
             fi
 
-            # Fallback signal: if marble had at least one active sshd session
-            # and now has zero, the connection dropped/closed — end the job
-            # too, instead of hanging for the full timeout.
-            ACTIVE=$(pgrep -u marble -f "sshd: marble@" | wc -l || true)
+            ACTIVE=$(pgrep -u runner -f "sshd: runner@" | wc -l || true)
             if [ "$ACTIVE" -gt 0 ]; then
               HAD_SESSION=1
             elif [ "$HAD_SESSION" -eq 1 ]; then
-              echo "marble's ssh session closed — ending session"
+              echo "runner's ssh session closed — ending session"
               break
             fi
 
