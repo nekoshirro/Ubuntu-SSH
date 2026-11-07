@@ -75,108 +75,93 @@ jobs:
         run: |
           set -e
 
+          cat > /tmp/setup-arch.sh << 'EOF'
+          #!/bin/bash
+          set -e
+
           echo "=================================================="
           echo "Configuring Pacman and mirrors..."
           echo "=================================================="
-          docker exec arch-runner bash -c '
-            sed -i "s/#ParallelDownloads = 5/ParallelDownloads = 10/" /etc/pacman.conf
-            sed -i "s/#Color/Color/" /etc/pacman.conf
-            pacman-key --init
-            pacman-key --populate archlinux
-            pacman -Sy --noconfirm archlinux-keyring
-            pacman -Syu --noconfirm
-          '
+          sed -i "s/#ParallelDownloads = 5/ParallelDownloads = 10/" /etc/pacman.conf
+          sed -i "s/#Color/Color/" /etc/pacman.conf
+          pacman-key --init
+          pacman-key --populate archlinux
+          pacman -Sy --noconfirm archlinux-keyring
+          pacman -Syu --noconfirm
 
           echo "=================================================="
           echo "Installing developer toolchain & utilities..."
           echo "=================================================="
-          docker exec arch-runner bash -c '
-            pacman -S --noconfirm --needed \
-              base-devel \
-              openssh \
-              tmux \
-              git \
-              curl \
-              wget \
-              nano \
-              neovim \
-              unzip \
-              bc \
-              bison \
-              cmake \
-              flex \
-              ninja \
-              libelf \
-              openssl \
-              lld \
-              texinfo \
-              xz \
-              zlib \
-              sudo \
-              fastfetch \
-              htop \
-              tree \
-              rsync
-          '
+          pacman -S --noconfirm --needed \
+            base-devel \
+            openssh \
+            tmux \
+            git \
+            curl \
+            wget \
+            nano \
+            neovim \
+            unzip \
+            bc \
+            bison \
+            cmake \
+            flex \
+            ninja \
+            libelf \
+            openssl \
+            lld \
+            texinfo \
+            xz \
+            zlib \
+            sudo \
+            fastfetch \
+            htop \
+            tree \
+            rsync
 
           echo "=================================================="
           echo "Installing yay (AUR Helper binary release)..."
           echo "=================================================="
-          docker exec arch-runner bash -c '
-            YAY_VER=$(curl -s https://api.github.com/repos/Jguer/yay/releases/latest | grep -oP "\"tag_name\": \"\K(.*)(?=\")" || echo "v12.4.2")
-            YAY_VER_CLEAN=${YAY_VER#v}
-            curl -sSL "https://github.com/Jguer/yay/releases/download/${YAY_VER}/yay_${YAY_VER_CLEAN}_x86_64.tar.gz" -o /tmp/yay.tar.gz
-            tar -xzf /tmp/yay.tar.gz -C /tmp
-            install -m 755 /tmp/yay_${YAY_VER_CLEAN}_x86_64/yay /usr/local/bin/yay
-            rm -rf /tmp/yay*
-            yay --version
-          '
+          YAY_VER=$(curl -s https://api.github.com/repos/Jguer/yay/releases/latest | grep -oP '"tag_name": "\K(.*)(?=")' || echo "v12.4.2")
+          YAY_VER_CLEAN=${YAY_VER#v}
+          curl -sSL "https://github.com/Jguer/yay/releases/download/${YAY_VER}/yay_${YAY_VER_CLEAN}_x86_64.tar.gz" -o /tmp/yay.tar.gz
+          tar -xzf /tmp/yay.tar.gz -C /tmp
+          install -m 755 /tmp/yay_${YAY_VER_CLEAN}_x86_64/yay /usr/local/bin/yay
+          rm -rf /tmp/yay*
+          yay --version
 
           echo "=================================================="
           echo "Installing ngrok binary..."
           echo "=================================================="
-          docker exec arch-runner bash -c '
-            curl -sSL https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-linux-amd64.tgz | tar -xz -C /usr/local/bin
-            chmod +x /usr/local/bin/ngrok
-            ngrok version
-          '
+          curl -sSL https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-linux-amd64.tgz | tar -xz -C /usr/local/bin
+          chmod +x /usr/local/bin/ngrok
+          ngrok version
 
           echo "=================================================="
           echo "Configuring runner user and authentication..."
           echo "=================================================="
-          PASSWORD=$(openssl rand -base64 9)
-          echo "SSH_PASSWORD=${PASSWORD}" >> "$GITHUB_ENV"
-
-          docker exec arch-runner bash -c "
-            useradd -m -s /bin/bash -G wheel runner
-            echo 'runner ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/runner
-            chmod 440 /etc/sudoers.d/runner
-            echo 'runner:${PASSWORD}' | chpasswd
-          "
-
-          if [ -n "${{ secrets.NGROK_AUTHTOKEN }}" ]; then
-            docker exec -u runner arch-runner ngrok config add-authtoken "${{ secrets.NGROK_AUTHTOKEN }}"
-          fi
+          useradd -m -s /bin/bash -G wheel runner
+          echo "runner ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/runner
+          chmod 440 /etc/sudoers.d/runner
 
           echo "=================================================="
           echo "Configuring tmux, bash profile and fastfetch..."
           echo "=================================================="
-          docker exec arch-runner bash -c '
-            cat > /home/runner/.tmux.conf <<\EOF
+          cat > /home/runner/.tmux.conf <<'TMUX_EOF'
           set -g mouse on
           set -g history-limit 50000
           set -g default-terminal "xterm-256color"
           set -s set-clipboard on
-          set -as terminal-features ",xterm*:clipboard"
+          set -as terminal-features ',xterm*:clipboard'
           bind-key -T copy-mode MouseDragEnd1Pane send-keys -X copy-pipe-no-clear
           bind-key -T copy-mode-vi MouseDragEnd1Pane send-keys -X copy-pipe-no-clear 2>/dev/null || true
-          EOF
+          TMUX_EOF
 
-            chown runner:runner /home/runner/.tmux.conf
-            chmod 644 /home/runner/.tmux.conf
-            cp /home/runner/.tmux.conf /etc/tmux.conf
+          chown runner:runner /home/runner/.tmux.conf
+          chmod 644 /home/runner/.tmux.conf
+          cp /home/runner/.tmux.conf /etc/tmux.conf
 
-            cat > /home/runner/.bash_profile <<\EOF
+          cat > /home/runner/.bash_profile <<'PROFILE_EOF'
           if [ -f ~/.bashrc ]; then
               . ~/.bashrc
           fi
@@ -187,13 +172,13 @@ jobs:
                   touch /tmp/stop
                   exit 0
               else
-                  echo "[Notice] Detached from tmux session \"main\"."
-                  echo "Run \"tmux attach -t main\" to re-enter, or \"exit\" to terminate runner."
+                  echo "[Notice] Detached from tmux session 'main'."
+                  echo "Run 'tmux attach -t main' to re-enter, or 'exit' to terminate runner."
               fi
           fi
-          EOF
+          PROFILE_EOF
 
-            cat > /home/runner/.bashrc <<\EOF
+          cat > /home/runner/.bashrc <<'RC_EOF'
           : "${TERM:=xterm-256color}"
           export TERM
           export PS1="\[\033[01;34m\]\u@archlinux\[\033[00m\]:\[\033[01;32m\]\w\[\033[00m\]\$ "
@@ -208,23 +193,34 @@ jobs:
               echo "  Swap usage:   $(free -m | awk 'NR==3 {printf "%.0f%%", ($2>0 ? $3*100/$2 : 0)}')"
               echo ""
           fi
-          EOF
+          RC_EOF
 
-            cat > /home/runner/.bash_logout <<\EOF
+          cat > /home/runner/.bash_logout <<'LOGOUT_EOF'
           if ! tmux has-session -t main 2>/dev/null; then
               touch /tmp/stop
           fi
-          EOF
+          LOGOUT_EOF
 
-            chown runner:runner \
-              /home/runner/.bash_profile \
-              /home/runner/.bashrc \
-              /home/runner/.bash_logout
-            chmod 644 \
-              /home/runner/.bash_profile \
-              /home/runner/.bashrc \
-              /home/runner/.bash_logout
-          '
+          chown runner:runner \
+            /home/runner/.bash_profile \
+            /home/runner/.bashrc \
+            /home/runner/.bash_logout
+          chmod 644 \
+            /home/runner/.bash_profile \
+            /home/runner/.bashrc \
+            /home/runner/.bash_logout
+
+          EOF
+          chmod +x /tmp/setup-arch.sh
+          docker exec arch-runner /tmp/setup-arch.sh
+
+          PASSWORD=$(openssl rand -base64 9)
+          echo "SSH_PASSWORD=${PASSWORD}" >> "$GITHUB_ENV"
+          docker exec arch-runner bash -c "echo 'runner:${PASSWORD}' | chpasswd"
+
+          if [ -n "${{ secrets.NGROK_AUTHTOKEN }}" ]; then
+            docker exec -u runner arch-runner ngrok config add-authtoken "${{ secrets.NGROK_AUTHTOKEN }}"
+          fi
 
           docker exec -u runner arch-runner bash -c '
             git config --global user.name "Hafidz Muzakky"
@@ -233,30 +229,31 @@ jobs:
           '
 
           if [ -n "${{ secrets.GH_PAT }}" ]; then
-            docker exec -u runner arch-runner bash -c "
-              echo 'https://${{ secrets.GH_PAT }}:x-oauth-basic@github.com' > /home/runner/.git-credentials
-              chmod 600 /home/runner/.git-credentials
-            "
+            docker exec -u runner arch-runner bash -c "echo 'https://${{ secrets.GH_PAT }}:x-oauth-basic@github.com' > /home/runner/.git-credentials && chmod 600 /home/runner/.git-credentials"
             echo "git-credential-store seeded from GH_PAT."
           fi
 
       - name: Configure and launch Arch Linux sshd
         run: |
-          docker exec arch-runner bash -c '
-            mkdir -p /var/empty /run/sshd
-            chmod 755 /var/empty
+          cat > /tmp/setup-sshd.sh << 'EOF'
+          #!/bin/bash
+          set -e
+          mkdir -p /var/empty /run/sshd
+          chmod 755 /var/empty
 
-            {
-              echo "Port 22"
-              echo "PasswordAuthentication yes"
-              echo "PermitRootLogin no"
-              echo "ClientAliveInterval 30"
-              echo "ClientAliveCountMax 10"
-            } > /etc/ssh/sshd_config.d/00-runner.conf
+          {
+            echo "Port 22"
+            echo "PasswordAuthentication yes"
+            echo "PermitRootLogin no"
+            echo "ClientAliveInterval 30"
+            echo "ClientAliveCountMax 10"
+          } > /etc/ssh/sshd_config.d/00-runner.conf
 
-            ssh-keygen -A
-            /usr/bin/sshd
-          '
+          ssh-keygen -A
+          /usr/bin/sshd
+          EOF
+          chmod +x /tmp/setup-sshd.sh
+          docker exec arch-runner /tmp/setup-sshd.sh
 
           echo "=================================================="
           echo "Listening sockets on host (bound by container)"
