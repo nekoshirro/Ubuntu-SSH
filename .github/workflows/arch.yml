@@ -1,0 +1,447 @@
+name: Arch Linux
+
+on:
+  workflow_dispatch:
+    inputs:
+      timeout_minutes:
+        description: 'Max session duration in minutes (GitHub free public repo hard cap ~360)'
+        required: false
+        default: '350'
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  ssh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Reclaim host disk space & provision 20GB swap
+        run: |
+          echo "=================================================="
+          echo "Cleaning host runner disk space..."
+          echo "=================================================="
+          sudo rm -rf \
+            /usr/local/lib/android \
+            /usr/share/dotnet \
+            /opt/ghc \
+            /usr/local/share/boost \
+            /opt/hostedtoolcache \
+            /usr/share/swift \
+            /usr/local/share/powershell 2>/dev/null || true
+
+          sudo docker image prune --all --force 2>/dev/null || true
+          sudo docker system prune --all --force --volumes 2>/dev/null || true
+
+          echo "=================================================="
+          echo "Configuring 20GB swapfile..."
+          echo "=================================================="
+          sudo swapoff -a 2>/dev/null || true
+          sudo rm -f /swapfile /mnt/swapfile 2>/dev/null || true
+          sudo fallocate -l 20G /swapfile 2>/dev/null || sudo dd if=/dev/zero of=/swapfile bs=1M count=20480 2>/dev/null
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+
+          free -h
+
+          echo "=================================================="
+          echo "Stopping host SSH daemon to free port 22..."
+          echo "=================================================="
+          sudo systemctl stop ssh.service 2>/dev/null || true
+          sudo systemctl stop sshd.service 2>/dev/null || true
+          sudo killall sshd 2>/dev/null || true
+
+      - name: Bootstrap and start Arch Linux container
+        run: |
+          echo "=================================================="
+          echo "Pulling and starting official Arch Linux container..."
+          echo "=================================================="
+          docker pull archlinux:base-devel
+
+          docker run -d \
+            --name arch-runner \
+            --privileged \
+            --net=host \
+            -v /swapfile:/swapfile \
+            -v /mnt:/mnt \
+            -v /tmp:/tmp \
+            archlinux:base-devel \
+            sleep infinity
+
+      - name: Provision Arch Linux environment, developer tools & user account
+        run: |
+          set -e
+
+          echo "=================================================="
+          echo "Configuring Pacman and mirrors..."
+          echo "=================================================="
+          docker exec arch-runner bash -c '
+            sed -i "s/#ParallelDownloads = 5/ParallelDownloads = 10/" /etc/pacman.conf
+            sed -i "s/#Color/Color/" /etc/pacman.conf
+            pacman-key --init
+            pacman-key --populate archlinux
+            pacman -Sy --noconfirm archlinux-keyring
+            pacman -Syu --noconfirm
+          '
+
+          echo "=================================================="
+          echo "Installing developer toolchain & utilities..."
+          echo "=================================================="
+          docker exec arch-runner bash -c '
+            pacman -S --noconfirm --needed \
+              base-devel \
+              openssh \
+              tmux \
+              git \
+              curl \
+              wget \
+              nano \
+              neovim \
+              unzip \
+              bc \
+              bison \
+              cmake \
+              flex \
+              ninja \
+              libelf \
+              openssl \
+              lld \
+              texinfo \
+              xz \
+              zlib \
+              sudo \
+              fastfetch \
+              htop \
+              tree \
+              rsync
+          '
+
+          echo "=================================================="
+          echo "Installing yay (AUR Helper binary release)..."
+          echo "=================================================="
+          docker exec arch-runner bash -c '
+            YAY_VER=$(curl -s https://api.github.com/repos/Jguer/yay/releases/latest | grep -oP "\"tag_name\": \"\K(.*)(?=\")" || echo "v12.4.2")
+            YAY_VER_CLEAN=${YAY_VER#v}
+            curl -sSL "https://github.com/Jguer/yay/releases/download/${YAY_VER}/yay_${YAY_VER_CLEAN}_x86_64.tar.gz" -o /tmp/yay.tar.gz
+            tar -xzf /tmp/yay.tar.gz -C /tmp
+            install -m 755 /tmp/yay_${YAY_VER_CLEAN}_x86_64/yay /usr/local/bin/yay
+            rm -rf /tmp/yay*
+            yay --version
+          '
+
+          echo "=================================================="
+          echo "Installing ngrok binary..."
+          echo "=================================================="
+          docker exec arch-runner bash -c '
+            curl -sSL https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-linux-amd64.tgz | tar -xz -C /usr/local/bin
+            chmod +x /usr/local/bin/ngrok
+            ngrok version
+          '
+
+          echo "=================================================="
+          echo "Configuring runner user and authentication..."
+          echo "=================================================="
+          PASSWORD=$(openssl rand -base64 9)
+          echo "SSH_PASSWORD=${PASSWORD}" >> "$GITHUB_ENV"
+
+          docker exec arch-runner bash -c "
+            useradd -m -s /bin/bash -G wheel runner
+            echo 'runner ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/runner
+            chmod 440 /etc/sudoers.d/runner
+            echo 'runner:${PASSWORD}' | chpasswd
+          "
+
+          if [ -n "${{ secrets.NGROK_AUTHTOKEN }}" ]; then
+            docker exec -u runner arch-runner ngrok config add-authtoken "${{ secrets.NGROK_AUTHTOKEN }}"
+          fi
+
+          echo "=================================================="
+          echo "Configuring tmux, bash profile and fastfetch..."
+          echo "=================================================="
+          docker exec arch-runner bash -c '
+            cat > /home/runner/.tmux.conf <<\EOF
+          set -g mouse on
+          set -g history-limit 50000
+          set -g default-terminal "xterm-256color"
+          set -s set-clipboard on
+          set -as terminal-features ",xterm*:clipboard"
+          bind-key -T copy-mode MouseDragEnd1Pane send-keys -X copy-pipe-no-clear
+          bind-key -T copy-mode-vi MouseDragEnd1Pane send-keys -X copy-pipe-no-clear 2>/dev/null || true
+          EOF
+
+            chown runner:runner /home/runner/.tmux.conf
+            chmod 644 /home/runner/.tmux.conf
+            cp /home/runner/.tmux.conf /etc/tmux.conf
+
+            cat > /home/runner/.bash_profile <<\EOF
+          if [ -f ~/.bashrc ]; then
+              . ~/.bashrc
+          fi
+
+          if [[ $- == *i* ]] && [ -t 0 ] && [ -z "$TMUX" ]; then
+              tmux new-session -A -s main
+              if ! tmux has-session -t main 2>/dev/null; then
+                  touch /tmp/stop
+                  exit 0
+              else
+                  echo "[Notice] Detached from tmux session \"main\"."
+                  echo "Run \"tmux attach -t main\" to re-enter, or \"exit\" to terminate runner."
+              fi
+          fi
+          EOF
+
+            cat > /home/runner/.bashrc <<\EOF
+          : "${TERM:=xterm-256color}"
+          export TERM
+          export PS1="\[\033[01;34m\]\u@archlinux\[\033[00m\]:\[\033[01;32m\]\w\[\033[00m\]\$ "
+
+          if [ -n "$TMUX" ] && [ -z "$TMUX_MOTD_SHOWN" ]; then
+              export TMUX_MOTD_SHOWN=1
+              command -v fastfetch >/dev/null 2>&1 && fastfetch || true
+              echo ""
+              echo "  System load:  $(awk '{print $1}' /proc/loadavg 2>/dev/null)"
+              echo "  Usage of /:   $(df -h / | awk 'NR==2 {print $5 " of " $2}')"
+              echo "  Memory usage: $(free -m | awk 'NR==2 {printf "%.0f%%", $3*100/$2}')"
+              echo "  Swap usage:   $(free -m | awk 'NR==3 {printf "%.0f%%", ($2>0 ? $3*100/$2 : 0)}')"
+              echo ""
+          fi
+          EOF
+
+            cat > /home/runner/.bash_logout <<\EOF
+          if ! tmux has-session -t main 2>/dev/null; then
+              touch /tmp/stop
+          fi
+          EOF
+
+            chown runner:runner \
+              /home/runner/.bash_profile \
+              /home/runner/.bashrc \
+              /home/runner/.bash_logout
+            chmod 644 \
+              /home/runner/.bash_profile \
+              /home/runner/.bashrc \
+              /home/runner/.bash_logout
+          '
+
+          docker exec -u runner arch-runner bash -c '
+            git config --global user.name "Hafidz Muzakky"
+            git config --global user.email "ais.muzakky@gmail.com"
+            git config --global credential.helper store
+          '
+
+          if [ -n "${{ secrets.GH_PAT }}" ]; then
+            docker exec -u runner arch-runner bash -c "
+              echo 'https://${{ secrets.GH_PAT }}:x-oauth-basic@github.com' > /home/runner/.git-credentials
+              chmod 600 /home/runner/.git-credentials
+            "
+            echo "git-credential-store seeded from GH_PAT."
+          fi
+
+      - name: Configure and launch Arch Linux sshd
+        run: |
+          docker exec arch-runner bash -c '
+            mkdir -p /var/empty /run/sshd
+            chmod 755 /var/empty
+
+            {
+              echo "Port 22"
+              echo "PasswordAuthentication yes"
+              echo "PermitRootLogin no"
+              echo "ClientAliveInterval 30"
+              echo "ClientAliveCountMax 10"
+            } > /etc/ssh/sshd_config.d/00-runner.conf
+
+            ssh-keygen -A
+            /usr/bin/sshd
+          '
+
+          echo "=================================================="
+          echo "Listening sockets on host (bound by container)"
+          echo "=================================================="
+          ss -tlnp | grep ':22' || echo "sshd is NOT listening on port 22!"
+
+          echo "=================================================="
+          echo "Loopback connection test"
+          echo "=================================================="
+          timeout 5 bash -c '</dev/tcp/127.0.0.1/22' \
+            && echo "OK: local port 22 accepts connections" \
+            || echo "FAILED: local port 22 refused/timed out"
+
+      - name: Open tunnels, check latency, keep session alive
+        run: |
+          set +e
+          set +o pipefail
+
+          echo "=================================================="
+          echo "ARCH LINUX SSH LOGIN INFORMATION"
+          echo "=================================================="
+          echo "OS      : Arch Linux (rolling release)"
+          echo "User    : runner"
+          echo "Password: ${SSH_PASSWORD}"
+          echo "=================================================="
+
+          nohup ngrok tcp 22 \
+            --region ap \
+            --log stdout \
+            > /tmp/ngrok.log 2>&1 &
+
+          NGROK_ADDR=""
+          for i in $(seq 1 15); do
+            sleep 2
+            NGROK_ADDR=$(
+              curl -s http://127.0.0.1:4040/api/tunnels \
+              | grep -o '"public_url":"tcp://[^"]*' \
+              | cut -d'/' -f3
+            )
+            [ -n "$NGROK_ADDR" ] && break
+          done
+
+          if [ -n "$NGROK_ADDR" ]; then
+            NGROK_HOST=$(echo "$NGROK_ADDR" | cut -d: -f1)
+            NGROK_PORT=$(echo "$NGROK_ADDR" | cut -d: -f2)
+
+            echo "[1/3] ngrok OK"
+            echo "      ssh runner@${NGROK_HOST} -p ${NGROK_PORT}"
+            echo ""
+            echo "      ngrok endpoint:"
+            echo "      ${NGROK_ADDR}"
+          else
+            echo "[1/3] ngrok FAILED"
+            echo "      Possible quota/authentication problem."
+            tail -n 30 /tmp/ngrok.log
+          fi
+
+          SERVEO_ALIAS="hafidz-arch-${RANDOM}${RANDOM}"
+          nohup ssh \
+            -o StrictHostKeyChecking=no \
+            -o ServerAliveInterval=30 \
+            -R ${SERVEO_ALIAS}:22:localhost:22 \
+            serveo.net \
+            > /tmp/serveo.log 2>&1 &
+
+          SERVEO_OK=""
+          for i in $(seq 1 15); do
+            sleep 2
+            SERVEO_OK=$(
+              grep -E \
+                'Forwarding (SSH traffic|TCP connections) from' \
+                /tmp/serveo.log \
+              | head -1
+            )
+            [ -n "$SERVEO_OK" ] && break
+          done
+
+          if [ -n "$SERVEO_OK" ]; then
+            echo "[2/3] serveo OK"
+            echo "      ssh -J serveo.net runner@${SERVEO_ALIAS}"
+          else
+            echo "[2/3] serveo FAILED"
+            echo "      Free community server may be unavailable."
+            tail -n 30 /tmp/serveo.log
+          fi
+
+          nohup ssh \
+            -p 443 \
+            -o StrictHostKeyChecking=no \
+            -o ServerAliveInterval=30 \
+            -R0:localhost:22 \
+            tcp@free.pinggy.io \
+            > /tmp/pinggy.log 2>&1 &
+
+          PINGGY_ADDR=""
+          for i in $(seq 1 15); do
+            sleep 2
+            PINGGY_ADDR=$(
+              grep -oE \
+                'tcp://[a-zA-Z0-9.-]+\.pinggy(-free)?\.(link|online):[0-9]+' \
+                /tmp/pinggy.log \
+              | head -1
+            )
+            [ -n "$PINGGY_ADDR" ] && break
+          done
+
+          if [ -n "$PINGGY_ADDR" ]; then
+            PINGGY_HOSTPORT=${PINGGY_ADDR#tcp://}
+            PINGGY_HOST=$(echo "$PINGGY_HOSTPORT" | cut -d: -f1)
+            PINGGY_PORT=$(echo "$PINGGY_HOSTPORT" | cut -d: -f2)
+
+            echo "[3/3] Pinggy OK"
+            echo "      ssh runner@${PINGGY_HOST} -p ${PINGGY_PORT}"
+          else
+            echo "[3/3] Pinggy FAILED"
+            tail -n 30 /tmp/pinggy.log
+          fi
+
+          echo "=================================================="
+          echo "Latency (measured FROM GitHub runner):"
+          echo "=================================================="
+          for entry in \
+            "ngrok:${NGROK_HOST:-}:${NGROK_PORT:-}" \
+            "pinggy:${PINGGY_HOST:-}:${PINGGY_PORT:-}"
+          do
+            name=${entry%%:*}
+            rest=${entry#*:}
+            host=${rest%%:*}
+            port=${rest##*:}
+
+            if [ -n "$host" ] && [ -n "$port" ]; then
+              t0=$(date +%s%N)
+              timeout 3 bash -c "</dev/tcp/${host}/${port}" 2>/dev/null
+              rc=$?
+              t1=$(date +%s%N)
+              if [ "$rc" -eq 0 ]; then
+                echo "  ${name}: $(( (t1 - t0) / 1000000 )) ms"
+              else
+                echo "  ${name}: connection failed"
+              fi
+            fi
+          done
+
+          echo "  serveo: skipped (jump-host mode)"
+          echo "=================================================="
+          echo ""
+          echo "To measure your client latency, connect first and run:"
+          echo "  ping <tunnel-host>"
+          echo "=================================================="
+
+          END=$(
+            (
+              SECONDS=0
+              echo $((SECONDS + ${{ github.event.inputs.timeout_minutes }} * 60))
+            )
+          )
+
+          HAD_SESSION=0
+          echo "Session timeout: ${{ github.event.inputs.timeout_minutes }} minutes"
+
+          while [ "$SECONDS" -lt "$END" ]; do
+            if [ -f /tmp/stop ]; then
+              echo "stop marker found."
+              echo "Session exited cleanly."
+              echo "Ending workflow session."
+              break
+            fi
+
+            ACTIVE=$(
+              docker exec arch-runner pgrep -u runner -f "sshd: runner@" \
+              | wc -l \
+              || true
+            )
+
+            if [ "$ACTIVE" -gt 0 ]; then
+              HAD_SESSION=1
+            elif [ "$HAD_SESSION" -eq 1 ] && ! docker exec -u runner arch-runner tmux has-session -t main 2>/dev/null; then
+              echo "runner SSH session closed and tmux session ended."
+              echo "Ending workflow session."
+              break
+            fi
+
+            sleep 5
+          done
+
+          echo "=================================================="
+          echo "Arch Linux session ended"
+          echo "=================================================="
