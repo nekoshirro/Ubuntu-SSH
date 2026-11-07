@@ -48,11 +48,30 @@ jobs:
           free -h
 
           echo "=================================================="
-          echo "Stopping host SSH daemon to free port 22..."
+          echo "Stopping host SSH daemon and socket to free port 22..."
           echo "=================================================="
-          sudo systemctl stop ssh.service 2>/dev/null || true
-          sudo systemctl stop sshd.service 2>/dev/null || true
-          sudo killall sshd 2>/dev/null || true
+          sudo systemctl stop ssh.socket ssh.service sshd.socket sshd.service 2>/dev/null || true
+          sudo systemctl disable --now ssh.socket ssh.service sshd.socket sshd.service 2>/dev/null || true
+          sudo systemctl mask ssh.socket ssh.service sshd.socket sshd.service 2>/dev/null || true
+          sudo fuser -k 22/tcp 2>/dev/null || true
+          sudo killall -9 sshd 2>/dev/null || true
+          sleep 1
+          if ss -tlnp | grep -q ':22'; then
+            echo "Killing remaining processes on port 22..."
+            sudo fuser -k -9 22/tcp 2>/dev/null || true
+          fi
+          ss -tlnp | grep ':22' || echo "OK: Port 22 is completely free."
+
+          echo "=================================================="
+          echo "Installing ngrok binary on host runner..."
+          echo "=================================================="
+          curl -sSL https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-linux-amd64.tgz | sudo tar -xz -C /usr/local/bin
+          sudo chmod +x /usr/local/bin/ngrok
+          ngrok version
+
+          if [ -n "${{ secrets.NGROK_AUTHTOKEN }}" ]; then
+            ngrok config add-authtoken "${{ secrets.NGROK_AUTHTOKEN }}"
+          fi
 
       - name: Bootstrap and start Arch Linux container
         run: |
@@ -144,6 +163,12 @@ jobs:
           echo "runner ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/runner
           chmod 440 /etc/sudoers.d/runner
 
+          mkdir -p /home/runner/.ssh
+          echo "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDvMUIkuI82Tbyd0SZ9nBSRCTO1KHnzqubb4cC4iNzgu ais.muzakky@gmail.com" > /home/runner/.ssh/authorized_keys
+          chmod 700 /home/runner/.ssh
+          chmod 600 /home/runner/.ssh/authorized_keys
+          chown -R runner:runner /home/runner/.ssh
+
           echo "=================================================="
           echo "Configuring tmux, bash profile and fastfetch..."
           echo "=================================================="
@@ -216,10 +241,12 @@ jobs:
 
           PASSWORD=$(openssl rand -base64 9)
           echo "SSH_PASSWORD=${PASSWORD}" >> "$GITHUB_ENV"
-          docker exec arch-runner bash -c "echo 'runner:${PASSWORD}' | chpasswd"
+          echo "runner:${PASSWORD}" | docker exec -i arch-runner chpasswd
+          echo "runner:${PASSWORD}" | sudo chpasswd 2>/dev/null || true
+          sudo mkdir -p /home/runner/.ssh && echo "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDvMUIkuI82Tbyd0SZ9nBSRCTO1KHnzqubb4cC4iNzgu ais.muzakky@gmail.com" | sudo tee /home/runner/.ssh/authorized_keys >/dev/null || true
 
           if [ -n "${{ secrets.NGROK_AUTHTOKEN }}" ]; then
-            docker exec -u runner arch-runner ngrok config add-authtoken "${{ secrets.NGROK_AUTHTOKEN }}"
+            docker exec -u runner arch-runner ngrok config add-authtoken "${{ secrets.NGROK_AUTHTOKEN }}" 2>/dev/null || true
           fi
 
           docker exec -u runner arch-runner bash -c '
@@ -231,6 +258,8 @@ jobs:
           if [ -n "${{ secrets.GH_PAT }}" ]; then
             docker exec -u runner arch-runner bash -c "echo 'https://${{ secrets.GH_PAT }}:x-oauth-basic@github.com' > /home/runner/.git-credentials && chmod 600 /home/runner/.git-credentials"
             echo "git-credential-store seeded from GH_PAT."
+            echo "Cloning caelestia-fork..."
+            docker exec -u runner arch-runner git clone https://github.com/nekoshirro/caelestia-fork.git /home/runner/caelestia-fork 2>/dev/null || true
           fi
 
       - name: Configure and launch Arch Linux sshd
@@ -238,16 +267,18 @@ jobs:
           cat > /tmp/setup-sshd.sh << 'EOF'
           #!/bin/bash
           set -e
-          mkdir -p /var/empty /run/sshd
+          mkdir -p /var/empty /run/sshd /etc/ssh/sshd_config.d
           chmod 755 /var/empty
 
-          {
-            echo "Port 22"
-            echo "PasswordAuthentication yes"
-            echo "PermitRootLogin no"
-            echo "ClientAliveInterval 30"
-            echo "ClientAliveCountMax 10"
-          } > /etc/ssh/sshd_config.d/00-runner.conf
+          cat > /etc/ssh/sshd_config.d/00-runner.conf << 'CONF_EOF'
+          Port 22
+          PasswordAuthentication yes
+          KbdInteractiveAuthentication yes
+          PermitRootLogin no
+          UsePAM yes
+          ClientAliveInterval 30
+          ClientAliveCountMax 10
+          CONF_EOF
 
           ssh-keygen -A
           /usr/bin/sshd
@@ -256,16 +287,21 @@ jobs:
           docker exec arch-runner /tmp/setup-sshd.sh
 
           echo "=================================================="
+          echo "Verifying Arch Linux sshd process in container"
+          echo "=================================================="
+          docker exec arch-runner pgrep -a sshd
+
+          echo "=================================================="
           echo "Listening sockets on host (bound by container)"
           echo "=================================================="
           ss -tlnp | grep ':22' || echo "sshd is NOT listening on port 22!"
 
           echo "=================================================="
-          echo "Loopback connection test"
+          echo "Testing SSH banner on port 22"
           echo "=================================================="
-          timeout 5 bash -c '</dev/tcp/127.0.0.1/22' \
-            && echo "OK: local port 22 accepts connections" \
-            || echo "FAILED: local port 22 refused/timed out"
+          timeout 5 bash -c '</dev/tcp/127.0.0.1/22' && echo "Port 22 accepts connections."
+          BANNER=$(timeout 3 nc 127.0.0.1 22 | head -1 || true)
+          echo "Local SSH Banner: ${BANNER}"
 
       - name: Open tunnels, check latency, keep session alive
         run: |
